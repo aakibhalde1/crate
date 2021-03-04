@@ -98,7 +98,7 @@ public class CrateDummyClusterServiceUnitTest extends ESTestCase {
         return EMPTY_CLUSTER_SETTINGS;
     }
 
-    protected ClusterService createClusterService(Collection<Setting<?>> additionalClusterSettings, Version version) {
+    public static ClusterService createClusterService(Collection<Setting<?>> additionalClusterSettings, Version version) {
         Set<Setting<?>> clusterSettingsSet = Sets.newHashSet(ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
         clusterSettingsSet.addAll(additionalClusterSettings);
         ClusterSettings clusterSettings = new ClusterSettings(Settings.EMPTY, clusterSettingsSet);
