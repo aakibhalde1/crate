@@ -67,4 +67,4 @@ Changes
 Fixes
 =====
 
-None
+- Adjusted ``crate-node`` auxiliary program to use the bundled Java runtime.
