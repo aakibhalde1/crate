@@ -27,15 +27,11 @@ import io.crate.execution.dml.delete.ShardDeleteRequest;
 import io.crate.execution.dml.upsert.FromRawInsertSource;
 import io.crate.execution.dml.upsert.ShardUpsertRequest;
 import io.crate.execution.dml.upsert.TransportShardUpsertAction;
-import io.crate.metadata.Functions;
-import io.crate.metadata.NodeContext;
-import io.crate.metadata.Schemas;
-import io.crate.test.integration.CrateDummyClusterServiceUnitTest;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.elasticsearch.Version;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.admin.indices.flush.FlushRequest;
-import org.elasticsearch.action.bulk.MappingUpdatePerformer;
 import org.elasticsearch.action.resync.ResyncReplicationRequest;
 import org.elasticsearch.action.resync.TransportResyncReplicationAction;
 import org.elasticsearch.action.support.ActionTestUtils;
@@ -56,7 +52,6 @@ import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.cluster.routing.ShardRoutingHelper;
 import org.elasticsearch.cluster.routing.ShardRoutingState;
 import org.elasticsearch.cluster.routing.TestShardRouting;
-import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.collect.Iterators;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.io.stream.StreamInput;
@@ -85,15 +80,16 @@ import org.elasticsearch.indices.recovery.RecoveryTarget;
 import org.elasticsearch.tasks.TaskManager;
 import org.elasticsearch.threadpool.ThreadPool;
 
+import javax.annotation.Nullable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -238,15 +234,15 @@ public abstract class ESIndexLevelReplicationTestCase extends IndexShardTestCase
             return numOfDoc;
         }
 
-        public BulkItemResponse index(IndexRequest indexRequest) throws Exception {
+        public ShardResponse index(IndexRequest indexRequest) throws Exception {
             return executeWriteRequest(indexRequest, indexRequest.getRefreshPolicy());
         }
 
-        public BulkItemResponse delete(DeleteRequest deleteRequest) throws Exception {
+        public ShardResponse delete(DeleteRequest deleteRequest) throws Exception {
             return executeWriteRequest(deleteRequest, deleteRequest.getRefreshPolicy());
         }
 
-        private BulkItemResponse executeWriteRequest(
+        private ShardResponse executeWriteRequest(
             DocWriteRequest<?> writeRequest,
             WriteRequest.RefreshPolicy refreshPolicy) throws Exception {
 
@@ -806,33 +802,37 @@ public abstract class ESIndexLevelReplicationTestCase extends IndexShardTestCase
             maxSeqNoOfUpdatesOrDeletes, permitAcquiredFuture, ThreadPool.Names.SAME, request);
         final Translog.Location location;
         try (Releasable ignored = permitAcquiredFuture.actionGet()) {
-            location = TransportShardBulkAction.performOnReplica(request, replica);
+            TransportWriteAction.WriteReplicaResult<ShardUpsertRequest> result = TransportShardUpsertAction.processOnReplica(
+                replica,
+                request,
+                logger);
+            location = result.location;
         }
-        TransportWriteActionTestHelper.performPostWriteActions(replica, request, location, logger);
+        performPostWriteActions(replica, location);
     }
 
     /**
      * indexes the given requests on the supplied primary, modifying it for replicas
      */
-    public BulkShardRequest indexOnPrimary(ShardUpsertRequest request, IndexShard primary) throws Exception {
+    public ShardUpsertRequest indexOnPrimary(ShardUpsertRequest request, IndexShard primary) throws Exception {
         return executeReplicationRequestOnPrimary(primary, request);
     }
 
     /**
      * Executes the delete request on the primary, and modifies it for replicas.
      */
-    BulkShardRequest deleteOnPrimary(ShardDeleteRequest request, IndexShard primary) throws Exception {
+    ShardUpsertRequest deleteOnPrimary(ShardDeleteRequest request, IndexShard primary) throws Exception {
         return executeReplicationRequestOnPrimary(primary, request);
     }
 
     /**
      * indexes the given requests on the supplied replica shard
      */
-    public void indexOnReplica(BulkShardRequest request, ReplicationGroup group, IndexShard replica) throws Exception {
+    public void indexOnReplica(ShardUpsertRequest request, ReplicationGroup group, IndexShard replica) throws Exception {
         indexOnReplica(request, group, replica, group.primary.getPendingPrimaryTerm());
     }
 
-    void indexOnReplica(BulkShardRequest request, ReplicationGroup group, IndexShard replica, long term) throws Exception {
+    void indexOnReplica(ShardUpsertRequest request, ReplicationGroup group, IndexShard replica, long term) throws Exception {
         executeShardBulkOnReplica(request, replica, term,
             group.primary.getLastKnownGlobalCheckpoint(), group.primary.getMaxSeqNoOfUpdatesOrDeletes());
     }
@@ -873,16 +873,16 @@ public abstract class ESIndexLevelReplicationTestCase extends IndexShardTestCase
         }
     }
 
-    class ResyncAction extends ReplicationAction<ResyncReplicationRequest, ResyncReplicationRequest, ResyncReplicationResponse> {
+    class ResyncAction extends ReplicationAction<ResyncReplicationRequest, ResyncReplicationRequest, ReplicationResponse> {
 
-        ResyncAction(ResyncReplicationRequest request, ActionListener<ResyncReplicationResponse> listener, ReplicationGroup group) {
+        ResyncAction(ResyncReplicationRequest request, ActionListener<ReplicationResponse> listener, ReplicationGroup group) {
             super(request, listener, group, "resync");
         }
 
         @Override
         protected void performOnPrimary(IndexShard primary, ResyncReplicationRequest request, ActionListener<PrimaryResult> listener) {
             ActionListener.completeWith(listener, () -> {
-                final TransportWriteAction.WritePrimaryResult<ResyncReplicationRequest, ResyncReplicationResponse> result =
+                final TransportWriteAction.WritePrimaryResult<ResyncReplicationRequest, ReplicationResponse> result =
                     executeResyncOnPrimary(primary, request);
                 return new PrimaryResult(result.replicaRequest(), result.finalResponseIfSuccessful);
             });
@@ -895,12 +895,12 @@ public abstract class ESIndexLevelReplicationTestCase extends IndexShardTestCase
         }
     }
 
-    private TransportWriteAction.WritePrimaryResult<ResyncReplicationRequest, ResyncReplicationResponse> executeResyncOnPrimary(
+    private TransportWriteAction.WritePrimaryResult<ResyncReplicationRequest, ReplicationResponse> executeResyncOnPrimary(
         IndexShard primary, ResyncReplicationRequest request) {
-        final TransportWriteAction.WritePrimaryResult<ResyncReplicationRequest, ResyncReplicationResponse> result =
-            new TransportWriteAction.WritePrimaryResult<>(TransportResyncReplicationAction.performOnPrimary(request),
-                new ResyncReplicationResponse(), null, null, primary, logger);
-        TransportWriteActionTestHelper.performPostWriteActions(primary, request, result.location, logger);
+        final TransportWriteAction.WritePrimaryResult<ResyncReplicationRequest, ReplicationResponse> result =
+            new TransportWriteAction.WritePrimaryResult<>(TransportResyncReplicationAction.performOnPrimary(request, primary),
+                new ReplicationResponse(), null, null, primary);
+        performPostWriteActions(primary, result.location);
         return result;
     }
 
@@ -913,14 +913,14 @@ public abstract class ESIndexLevelReplicationTestCase extends IndexShardTestCase
         try (Releasable ignored = acquirePermitFuture.actionGet()) {
             location = TransportResyncReplicationAction.performOnReplica(request, replica);
         }
-        TransportWriteActionTestHelper.performPostWriteActions(replica, request, location, logger);
+        performPostWriteActions(replica, location);
     }
 
     class SyncRetentionLeases extends ReplicationAction<
-        RetentionLeaseSyncAction.Request, RetentionLeaseSyncAction.Request, RetentionLeaseSyncAction.Response> {
+        RetentionLeaseSyncAction.Request, RetentionLeaseSyncAction.Request, ReplicationResponse> {
 
         SyncRetentionLeases(RetentionLeaseSyncAction.Request request, ReplicationGroup group,
-                            ActionListener<RetentionLeaseSyncAction.Response> listener)  {
+                            ActionListener<ReplicationResponse> listener)  {
             super(request, listener, group, "sync-retention-leases");
         }
 
@@ -937,6 +937,27 @@ public abstract class ESIndexLevelReplicationTestCase extends IndexShardTestCase
         protected void performOnReplica(RetentionLeaseSyncAction.Request request, IndexShard replica) throws Exception {
             replica.updateRetentionLeasesOnReplica(request.getRetentionLeases());
             replica.persistRetentionLeases();
+        }
+    }
+
+    public static void performPostWriteActions(final IndexShard indexShard, @Nullable final Translog.Location location) {
+        final CountDownLatch latch = new CountDownLatch(1);
+        TransportWriteAction.RespondingWriteResult writerResult = new TransportWriteAction.RespondingWriteResult() {
+            @Override
+            public void onSuccess(boolean forcedRefresh) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onFailure(Exception ex) {
+                throw new AssertionError(ex);
+            }
+        };
+        new TransportWriteAction.AsyncAfterWriteAction(indexShard, location, writerResult).run();
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            throw new AssertionError(e);
         }
     }
 

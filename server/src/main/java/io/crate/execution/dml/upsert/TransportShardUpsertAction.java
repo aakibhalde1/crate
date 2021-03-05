@@ -232,8 +232,15 @@ public class TransportShardUpsertAction extends TransportShardAction<ShardUpsert
         return new WritePrimaryResult<>(request, shardResponse, translogLocation, null, indexShard);
     }
 
+
+
+
     @Override
     protected WriteReplicaResult<ShardUpsertRequest> processRequestItemsOnReplica(IndexShard indexShard, ShardUpsertRequest request) throws IOException {
+        return processOnReplica(indexShard, request, logger);
+    }
+
+    public static WriteReplicaResult<ShardUpsertRequest> processOnReplica(IndexShard indexShard, ShardUpsertRequest request, Logger logger) throws IOException {
         Translog.Location location = null;
         for (ShardUpsertRequest.Item item : request.items()) {
             if (item.source() == null) {
